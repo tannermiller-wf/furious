@@ -41,7 +41,7 @@ Usage:
             queue='workgroup')
 
 """
-
+from itertools import izip
 import uuid
 
 from ..job_utils import decode_callbacks
@@ -247,20 +247,124 @@ def _insert_tasks(tasks, queue, transactional=False):
     if not tasks:
         return 0
 
+    try:
+        taskqueue.Queue(name=queue).add(tasks, transactional=transactional)
+        return len(tasks)
+    except (taskqueue.BadTaskStateError,
+            taskqueue.TaskAlreadyExistsError,
+            taskqueue.TombstonedTaskError,
+            taskqueue.TransientError):
+        count = len(tasks)
+        if count <= 1:
+            return 0
+
+        inserted = _insert_tasks(tasks[:count / 2], queue, transactional)
+        inserted += _insert_tasks(tasks[count / 2:], queue, transactional)
+
+        return inserted
+
+
+def _insert_tasks_all_async(tasks, queue, transactional=False):
+    from google.appengine.api import taskqueue
+
+    if not tasks:
+        return 0
+
+    inserted = 0
+    results = []
+    good_tasks = []
+
+    for task in tasks[:]:
+        try:
+            results.append(taskqueue.Queue(name=queue).add_async(
+                task, transactional=transactional))
+            good_tasks.append(task)
+        except taskqueue.BadTaskStateError:
+            pass
+
+    next_attempt = []
+    for result, good in izip(results, good_tasks):
+        try:
+            result.get_result()
+            inserted += 1
+        except taskqueue.TransientError:
+            next_attempt.append(good)
+        except (taskqueue.BadTaskStateError,
+                taskqueue.TaskAlreadyExistsError,
+                taskqueue.TombstonedTaskError):
+            pass
+
+    if next_attempt:
+        inserted += _insert_tasks_all_async(
+            next_attempt, queue, transactional=transactional)
+
+    return inserted
+
+
+def _insert_tasks_batched_async(
+        tasks, queue, transactional=False, batch_size=20):
+    from google.appengine.api import taskqueue
+
+    if not tasks:
+        return 0
+
     inserted = len(tasks)
 
-    # NOTE: I don't believe we need all these exceptions on here anymore, but
-    # I'm going to leave them just to be safe.
-    for task in tasks:
+    for batch in _task_batcher(tasks, batch_size=batch_size):
         try:
             taskqueue.Queue(name=queue).add_async(
-                task, transactional=transactional)
+                batch, transactional=transactional)
+            return len(tasks)
         except (taskqueue.BadTaskStateError,
                 taskqueue.TaskAlreadyExistsError,
                 taskqueue.TombstonedTaskError,
                 taskqueue.TransientError):
-            # TODO: Not sure if this is correct anymore. Any thoughts?
-            inserted -= 1
+            inserted -= batch_size
+
+    return inserted
+
+
+def _insert_tasks_async_on_fail(tasks, queue, transactional=False):
+    from google.appengine.api import taskqueue
+
+    if not tasks:
+        return 0
+
+    try:
+        taskqueue.Queue(name=queue).add(tasks, transactional=transactional)
+        return len(tasks)
+    except (taskqueue.BadTaskStateError,
+            taskqueue.TaskAlreadyExistsError,
+            taskqueue.TombstonedTaskError,
+            taskqueue.TransientError):
+        return _insert_tasks_all_async(
+            tasks, queue, transactional=transactional)
+
+
+def _insert_tasks_batched_async_with_all_async_on_fail(
+        tasks, queue, transactional=False, batch_size=20):
+    from google.appengine.api import taskqueue
+
+    if not tasks:
+        return 0
+
+    inserted = 0
+    results = []
+    batches = list(_task_batcher(tasks, batch_size=batch_size))
+
+    for batch in batches:
+        results.append(taskqueue.Queue(name=queue).add_async(
+            batch, transactional=transactional))
+
+    for result, batch in izip(results, batches):
+        try:
+            inserted += len(result.get_result())
+        except (taskqueue.BadTaskStateError,
+                taskqueue.TaskAlreadyExistsError,
+                taskqueue.TombstonedTaskError,
+                taskqueue.TransientError):
+            inserted += _insert_tasks_all_async(
+                tasks, queue, transactional=transactional)
 
     return inserted
 
